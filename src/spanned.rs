@@ -13,9 +13,10 @@ use std::{
 pub(crate) const NAME: &str = "$__serde_private_Spanned";
 pub(crate) const START: &str = "$__serde_private_start";
 pub(crate) const LENGTH: &str = "$__serde_private_length";
+pub(crate) const PATH: &str = "$__serde_private_path";
 pub(crate) const VALUE: &str = "$__serde_private_value";
 
-pub(crate) const FIELDS: &[&str] = &[START, LENGTH, VALUE];
+pub(crate) const FIELDS: &[&str] = &[START, LENGTH, PATH, VALUE];
 
 /// An wrapper which records the location of an item as byte indices into the
 /// source text.
@@ -90,16 +91,17 @@ pub(crate) const FIELDS: &[&str] = &[START, LENGTH, VALUE];
 /// # }
 /// ```
 ///
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Spanned<T> {
     pub value: T,
     pub start: usize,
+    pub path: String,
     pub len: usize,
 }
 
 impl<T> Spanned<T> {
-    pub const fn new(start: usize, len: usize, value: T) -> Self {
-        Spanned { value, start, len }
+    pub const fn new(start: usize, len: usize, path: String, value: T) -> Self {
+        Spanned { value, start, len, path }
     }
 
     /// The value's location in source as an inclusive range.
@@ -192,7 +194,13 @@ where
 
         let length: usize = visitor.next_value()?;
 
-        Ok(Spanned::new(start, length, value))
+        if visitor.next_key()? != Some(PATH) {
+            return Err(Error::custom("spanned length key not found"));
+        }
+
+        let path: String = visitor.next_value()?;
+
+        Ok(Spanned::new(start, length, path, value))
     }
 }
 
@@ -202,7 +210,7 @@ mod tests {
 
     #[test]
     fn serializing_a_spanned_t_is_a_noop() {
-        let value = Spanned::new(0, 0, "Hello, World!");
+        let value = Spanned::new(0, 0, String::from(".[0]"), "Hello, World!");
         let should_be = r#"---
 "Hello, World!"
 "#;
@@ -215,7 +223,7 @@ mod tests {
     #[test]
     fn deserialize_spanned_item() {
         let src = "42";
-        let should_be = Spanned::new(0, src.len(), 42);
+        let should_be = Spanned::new(0, src.len(), String::from("."), 42);
 
         let got: Spanned<i32> = crate::from_str(src).unwrap();
 
@@ -228,10 +236,11 @@ mod tests {
         let should_be = Spanned::new(
             1,
             src.len() - 1,
+            String::from("."),
             vec![
-                Spanned::new(2, 1, 1),
-                Spanned::new(5, 2, 22),
-                Spanned::new(9, 3, 333),
+                Spanned::new(2, 1, String::from(".[0]"), 1),
+                Spanned::new(5, 2, String::from(".[1]"), 22),
+                Spanned::new(9, 3, String::from(".[2]"), 333),
             ],
         );
 
@@ -263,15 +272,17 @@ mod tests {
             Spanned::new(
                 7,
                 59,
+                String::from(".[0]"),
                 Item {
-                    name: Spanned::new(9, 5, String::from("first")),
+                    name: Spanned::new(9, 5, String::from(".[0].name"), String::from("first")),
                     values: Spanned::new(
                         25,
                         9,
+                        String::from(".[0].values"),
                         vec![
-                            Spanned::new(26, 1, 1),
-                            Spanned::new(29, 1, 2),
-                            Spanned::new(32, 1, 3),
+                            Spanned::new(26, 1, String::from(".[0].values[0]"), 1),
+                            Spanned::new(29, 1, String::from(".[0].values[1]"), 2),
+                            Spanned::new(32, 1, String::from(".[0].values[2]"), 3),
                         ],
                     ),
                 },
@@ -279,17 +290,19 @@ mod tests {
             Spanned::new(
                 41,
                 23,
+                String::from(".[1]"),
                 Item {
-                    name: Spanned::new(43, 6, String::from("second")),
+                    name: Spanned::new(43, 6, String::from(".[1].name"), String::from("second")),
                     values: Spanned::new(
                         60,
                         6,
-                        vec![Spanned::new(61, 1, 4), Spanned::new(64, 1, 5)],
+                        String::from(".[1].values"),
+                        vec![Spanned::new(61, 1, String::from(".[1].values[0]"), 4), Spanned::new(64, 1, String::from(".[1].values[1]"), 5)],
                     ),
                 },
             ),
         ];
-        let should_be = Spanned::new(1, src.len(), items);
+        let should_be = Spanned::new(1, src.len(), String::from("."), items);
 
         let got: Spanned<Vec<Spanned<Item>>> = crate::from_str(src).unwrap();
 
@@ -320,6 +333,7 @@ mod tests {
                 value: Nested {
                     value: String::from("Hello, World!"),
                 },
+                path: String::from("nested"),
             },
         };
 
@@ -349,6 +363,7 @@ mod tests {
                 value: Nested {
                     value: String::new(),
                 },
+                path: String::from("nested"),
             },
         };
 

@@ -922,6 +922,11 @@ impl<'de, 'a, 'r> de::MapAccess<'de> for SpannedMapAccess<'a, 'r> {
                 seed.deserialize(BorrowedStrDeserializer::new(crate::spanned::LENGTH))
                     .map(Some)
             }
+            SpannedMapAccessState::PathKey => {
+                self.state = SpannedMapAccessState::DeserializePath;
+                seed.deserialize(BorrowedStrDeserializer::new(crate::spanned::PATH))
+                    .map(Some)
+            }
             SpannedMapAccessState::Done => Ok(None),
             other => unreachable!("Invalid state: {:?}", other),
         }
@@ -949,8 +954,12 @@ impl<'de, 'a, 'r> de::MapAccess<'de> for SpannedMapAccess<'a, 'r> {
                 seed.deserialize(&mut value_de)
             }
             SpannedMapAccessState::DeserializeLength => {
-                self.state = SpannedMapAccessState::Done;
+                self.state = SpannedMapAccessState::PathKey;
                 seed.deserialize(self.current_item_length()?.into_deserializer())
+            }
+            SpannedMapAccessState::DeserializePath => {
+                self.state = SpannedMapAccessState::Done;
+                seed.deserialize(self.de.path.to_string().into_deserializer())
             }
             _ => todo!(),
         }
@@ -965,6 +974,8 @@ enum SpannedMapAccessState {
     DeserializeValue,
     LengthKey,
     DeserializeLength,
+    PathKey,
+    DeserializePath,
     Done,
 }
 
