@@ -93,6 +93,14 @@ impl Error {
     pub fn location(&self) -> Option<Location> {
         self.0.location()
     }
+
+    /// Returns the path from the error if one exists
+    pub fn path(&self) -> Option<&String> {
+        match self.0.as_ref() {
+            ErrorImpl::Message(_, Some(pos)) => Some(&pos.path),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn end_of_stream() -> Error {
