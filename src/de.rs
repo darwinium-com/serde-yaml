@@ -935,14 +935,14 @@ impl<'de, 'a, 'r> de::EnumAccess<'de> for EnumAccess<'a, 'r> {
         } else {
             match match self.de.next_event()? {
                 Event::Scalar(bytes, _, _) => str::from_utf8(bytes).ok(),
-                Event::MappingStart => {
+                Event::MappingEnd => {
                     let bad = BadKey { name: self.name };
                     return Err(de::Error::invalid_type(
                         Unexpected::Map,
                         &bad,
                     ));
                 }
-                Event::SequenceStart => {
+                Event::SequenceEnd => {
                     let bad = BadKey { name: self.name };
                     return Err(de::Error::invalid_type(
                         Unexpected::Seq,
