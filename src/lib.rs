@@ -133,6 +133,6 @@ mod loader;
 pub mod mapping;
 mod number;
 mod path;
-mod ser
+mod ser;
 mod spanned;
 pub mod value;

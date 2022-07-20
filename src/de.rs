@@ -523,11 +523,11 @@ impl<'a> DeserializerFromEvents<'a> {
         Ok(value)
     }
 
-    fn visit_spanned<'de, V>(&mut self, visitor: V) -> Result<V::Value>
+    fn visit_spanned<'de, V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.recursion_check(|de| {
+        self.recursion_check(mark, |de| {
             let pos = *de.pos;
             let mut map = SpannedMapAccess {
                 de,
@@ -748,24 +748,25 @@ impl<'de, 'a, 'r> SpannedMapAccess<'a, 'r> {
     fn start_location(&self) -> Result<usize> {
         let (_event, marker) = self
             .de
+            .document
             .events
             .get(self.pos)
             .ok_or_else(crate::error::end_of_stream)?;
 
-        Ok(marker.index())
+        Ok(marker.index() as usize)
     }
 
     fn index_of_sequence_end(&self) -> Result<usize> {
         let mut nesting_level = 0;
 
-        for (event, marker) in &self.de.events[self.pos..] {
+        for (event, marker) in &self.de.document.events[self.pos..] {
             if matches!(event, Event::SequenceStart) {
                 nesting_level += 1;
             } else if matches!(event, Event::SequenceEnd) {
                 nesting_level -= 1;
 
                 if nesting_level == 0 {
-                    return Ok(marker.index() + 1);
+                    return Ok(marker.index() as usize + 1);
                 }
             }
         }
@@ -777,7 +778,7 @@ impl<'de, 'a, 'r> SpannedMapAccess<'a, 'r> {
         let mut nesting_level = 0;
         let mut last_index = None;
 
-        for (event, marker) in &self.de.events[self.pos - 1..] {
+        for (event, marker) in &self.de.document.events[self.pos - 1..] {
             if matches!(event, Event::SequenceStart) {
                 nesting_level += 1;
             } else if matches!(event, Event::SequenceEnd) {
@@ -790,7 +791,7 @@ impl<'de, 'a, 'r> SpannedMapAccess<'a, 'r> {
 
             // Note: subtract one because of inclusive end, then subtract
             // another because that's what makes tests pass
-            last_index = Some(marker.index());
+            last_index = Some(marker.index() as usize);
         }
 
         last_index.ok_or_else(crate::error::end_of_stream)
@@ -801,6 +802,7 @@ impl<'de, 'a, 'r> SpannedMapAccess<'a, 'r> {
         // not the end position/length, so we try to calculate it ourselves.
         let (event, marker) = self
             .de
+            .document
             .events
             .get(self.pos)
             .ok_or_else(crate::error::end_of_stream)?;
@@ -810,9 +812,9 @@ impl<'de, 'a, 'r> SpannedMapAccess<'a, 'r> {
             // because of our inclusive end bound.
             Event::Scalar(token, _, _) => token.len(),
             // find the index of the end token
-            Event::SequenceStart => self.index_of_sequence_end()? - marker.index(),
+            Event::SequenceStart => self.index_of_sequence_end()? - marker.index() as usize,
             // find the index of the end token
-            Event::MappingStart => self.index_of_mapping_end()? - marker.index(),
+            Event::MappingStart => self.index_of_mapping_end()? - marker.index() as usize,
             _ => 0,
         };
 
@@ -866,8 +868,7 @@ impl<'de, 'a, 'r> de::MapAccess<'de> for SpannedMapAccess<'a, 'r> {
             SpannedMapAccessState::DeserializeValue => {
                 self.state = SpannedMapAccessState::LengthKey;
                 let mut value_de = DeserializerFromEvents {
-                    events: self.de.events,
-                    aliases: self.de.aliases,
+                    document: self.de.document,
                     pos: self.de.pos,
                     path: self.de.path,
                     remaining_depth: self.de.remaining_depth,
@@ -1455,7 +1456,9 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
         V: Visitor<'de>,
     {
         if name == crate::spanned::NAME && fields == crate::spanned::FIELDS {
-            return self.visit_spanned(visitor);
+            if let Ok((_, mark)) = self.peek_event_mark() {
+                return self.visit_spanned(visitor, mark);
+            }
         }
 
         let (next, mark) = self.next_event_mark()?;
