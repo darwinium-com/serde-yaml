@@ -1,21 +1,20 @@
 use crate::error::{self, Error, ErrorImpl, Result};
+use crate::libyaml::error::Mark;
+use crate::libyaml::parser::ScalarStyle;
+use crate::libyaml::tag::Tag;
+use crate::loader::{Document, Loader};
 use crate::path::Path;
 use serde::de::{
     self, value::BorrowedStrDeserializer, Deserialize, DeserializeOwned, DeserializeSeed, Expected,
     IgnoredAny as Ignore, IntoDeserializer, Unexpected, Visitor,
 };
-use serde::serde_if_integer128;
-use std::collections::BTreeMap;
 use std::f64;
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
 use std::str;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use yaml_rust::parser::{Event as YamlEvent, MarkedEventReceiver, Parser};
-use yaml_rust::scanner::{Marker, TScalarStyle, TokenType};
 
 /// A structure that deserializes YAML into Rust values.
 ///
@@ -29,7 +28,7 @@ use yaml_rust::scanner::{Marker, TScalarStyle, TokenType};
 /// use serde_yaml::Value;
 ///
 /// fn main() -> Result<()> {
-///     let input = "---\nk: 107\n";
+///     let input = "k: 107\n";
 ///     let de = serde_yaml::Deserializer::from_str(input);
 ///     let value = Value::deserialize(de)?;
 ///     println!("{:?}", value);
@@ -56,28 +55,29 @@ use yaml_rust::scanner::{Marker, TScalarStyle, TokenType};
 /// }
 /// ```
 pub struct Deserializer<'a> {
-    input: Input<'a>,
+    progress: Progress<'a>,
 }
 
-enum Input<'a> {
+pub(crate) enum Progress<'a> {
     Str(&'a str),
     Slice(&'a [u8]),
     Read(Box<dyn io::Read + 'a>),
-    Multidoc(Arc<Multidoc>),
+    Iterable(Loader<'a>),
+    Document(Document),
     Fail(Arc<ErrorImpl>),
 }
 
 impl<'a> Deserializer<'a> {
     /// Creates a YAML deserializer from a `&str`.
     pub fn from_str(s: &'a str) -> Self {
-        let input = Input::Str(s);
-        Deserializer { input }
+        let progress = Progress::Str(s);
+        Deserializer { progress }
     }
 
     /// Creates a YAML deserializer from a `&[u8]`.
     pub fn from_slice(v: &'a [u8]) -> Self {
-        let input = Input::Slice(v);
-        Deserializer { input }
+        let progress = Progress::Slice(v);
+        Deserializer { progress }
     }
 
     /// Creates a YAML deserializer from an `io::Read`.
@@ -89,37 +89,36 @@ impl<'a> Deserializer<'a> {
     where
         R: io::Read + 'a,
     {
-        let input = Input::Read(Box::new(rdr));
-        Deserializer { input }
+        let progress = Progress::Read(Box::new(rdr));
+        Deserializer { progress }
     }
 
     fn de<T>(self, f: impl FnOnce(&mut DeserializerFromEvents) -> Result<T>) -> Result<T> {
-        if let Input::Multidoc(multidoc) = &self.input {
-            let mut pos = multidoc.pos.load(Ordering::Relaxed);
-            let t = f(&mut DeserializerFromEvents {
-                events: &multidoc.loader.events,
-                aliases: &multidoc.loader.aliases,
-                pos: &mut pos,
-                path: Path::Root,
-                remaining_depth: 128,
-            })?;
-            multidoc.pos.store(pos, Ordering::Relaxed);
-            return Ok(t);
+        match &self.progress {
+            Progress::Iterable(_) => return Err(error::more_than_one_document()),
+            Progress::Document(document) => {
+                let mut pos = 0;
+                let t = f(&mut DeserializerFromEvents {
+                    document,
+                    pos: &mut pos,
+                    path: Path::Root,
+                    remaining_depth: 128,
+                })?;
+                return Ok(t);
+            }
+            _ => {}
         }
 
-        let loader = loader(self.input)?;
-        if loader.events.is_empty() {
-            return Err(error::end_of_stream());
-        }
+        let mut loader = Loader::new(self.progress)?;
+        let document = loader.next_document().ok_or_else(error::end_of_stream)?;
         let mut pos = 0;
         let t = f(&mut DeserializerFromEvents {
-            events: &loader.events,
-            aliases: &loader.aliases,
+            document: &document,
             pos: &mut pos,
             path: Path::Root,
             remaining_depth: 128,
         })?;
-        if pos == loader.events.len() {
+        if loader.next_document().is_none() {
             Ok(t)
         } else {
             Err(error::more_than_one_document())
@@ -127,89 +126,38 @@ impl<'a> Deserializer<'a> {
     }
 }
 
-fn loader(input: Input) -> Result<Loader> {
-    enum Input2<'a> {
-        Str(&'a str),
-        Slice(&'a [u8]),
-    }
-
-    let mut buffer;
-    let input = match input {
-        Input::Str(s) => Input2::Str(s),
-        Input::Slice(bytes) => Input2::Slice(bytes),
-        Input::Read(mut rdr) => {
-            buffer = Vec::new();
-            rdr.read_to_end(&mut buffer).map_err(error::io)?;
-            Input2::Slice(&buffer)
-        }
-        Input::Multidoc(_) => unreachable!(),
-        Input::Fail(err) => return Err(error::shared(err)),
-    };
-
-    let input = match input {
-        Input2::Str(s) => s,
-        Input2::Slice(bytes) => str::from_utf8(bytes).map_err(error::str_utf8)?,
-    };
-
-    let mut parser = Parser::new(input.chars());
-    let mut loader = Loader {
-        events: Vec::new(),
-        aliases: BTreeMap::new(),
-    };
-    parser.load(&mut loader, true).map_err(error::scanner)?;
-    Ok(loader)
-}
-
-struct Multidoc {
-    loader: Loader,
-    pos: AtomicUsize,
-}
-
 impl<'de> Iterator for Deserializer<'de> {
     type Item = Self;
 
     fn next(&mut self) -> Option<Self> {
-        match &self.input {
-            Input::Multidoc(multidoc) => {
-                let pos = multidoc.pos.load(Ordering::Relaxed);
-                return if pos < multidoc.loader.events.len() {
-                    Some(Deserializer {
-                        input: Input::Multidoc(Arc::clone(multidoc)),
-                    })
-                } else {
-                    None
-                };
-            }
-            Input::Fail(err) => {
+        match &mut self.progress {
+            Progress::Iterable(loader) => {
+                let document = loader.next_document()?;
                 return Some(Deserializer {
-                    input: Input::Fail(Arc::clone(err)),
+                    progress: Progress::Document(document),
+                });
+            }
+            Progress::Document(_) => return None,
+            Progress::Fail(err) => {
+                return Some(Deserializer {
+                    progress: Progress::Fail(Arc::clone(err)),
                 });
             }
             _ => {}
         }
 
-        let dummy = Input::Str("");
-        let input = mem::replace(&mut self.input, dummy);
-        match loader(input) {
+        let dummy = Progress::Str("");
+        let input = mem::replace(&mut self.progress, dummy);
+        match Loader::new(input) {
             Ok(loader) => {
-                let multidoc = Arc::new(Multidoc {
-                    loader,
-                    pos: AtomicUsize::new(0),
-                });
-                self.input = Input::Multidoc(Arc::clone(&multidoc));
-                if multidoc.loader.events.is_empty() {
-                    None
-                } else {
-                    Some(Deserializer {
-                        input: Input::Multidoc(multidoc),
-                    })
-                }
+                self.progress = Progress::Iterable(loader);
+                self.next()
             }
             Err(err) => {
                 let fail = err.shared();
-                self.input = Input::Fail(Arc::clone(&fail));
+                self.progress = Progress::Fail(Arc::clone(&fail));
                 Some(Deserializer {
-                    input: Input::Fail(fail),
+                    progress: Progress::Fail(fail),
                 })
             }
         }
@@ -261,13 +209,11 @@ impl<'de> de::Deserializer<'de> for Deserializer<'de> {
         self.de(|state| state.deserialize_i64(visitor))
     }
 
-    serde_if_integer128! {
-        fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
-        where
-            V: Visitor<'de>,
-        {
-            self.de(|state| state.deserialize_i128(visitor))
-        }
+    fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.de(|state| state.deserialize_i128(visitor))
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
@@ -298,13 +244,11 @@ impl<'de> de::Deserializer<'de> for Deserializer<'de> {
         self.de(|state| state.deserialize_u64(visitor))
     }
 
-    serde_if_integer128! {
-        fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
-        where
-            V: Visitor<'de>,
-        {
-            self.de(|state| state.deserialize_u128(visitor))
-        }
+    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.de(|state| state.deserialize_u128(visitor))
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
@@ -456,45 +400,9 @@ impl<'de> de::Deserializer<'de> for Deserializer<'de> {
     }
 }
 
-pub struct Loader {
-    events: Vec<(Event, Marker)>,
-    /// Map from alias id to index in events.
-    aliases: BTreeMap<usize, usize>,
-}
-
-impl MarkedEventReceiver for Loader {
-    fn on_event(&mut self, event: YamlEvent, marker: Marker) {
-        let event = match event {
-            YamlEvent::Nothing
-            | YamlEvent::StreamStart
-            | YamlEvent::StreamEnd
-            | YamlEvent::DocumentStart
-            | YamlEvent::DocumentEnd => return,
-
-            YamlEvent::Alias(id) => Event::Alias(id),
-            YamlEvent::Scalar(value, style, id, tag) => {
-                self.aliases.insert(id, self.events.len());
-                Event::Scalar(value, style, tag)
-            }
-            YamlEvent::SequenceStart(id) => {
-                self.aliases.insert(id, self.events.len());
-                Event::SequenceStart
-            }
-            YamlEvent::SequenceEnd => Event::SequenceEnd,
-            YamlEvent::MappingStart(id) => {
-                self.aliases.insert(id, self.events.len());
-                Event::MappingStart
-            }
-            YamlEvent::MappingEnd => Event::MappingEnd,
-        };
-        self.events.push((event, marker));
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum Event {
+pub(crate) enum Event {
     Alias(usize),
-    Scalar(String, TScalarStyle, Option<TokenType>),
+    Scalar(Box<[u8]>, ScalarStyle, Option<Tag>),
     SequenceStart,
     SequenceEnd,
     MappingStart,
@@ -502,40 +410,44 @@ enum Event {
 }
 
 struct DeserializerFromEvents<'a> {
-    events: &'a [(Event, Marker)],
-    /// Map from alias id to index in events.
-    aliases: &'a BTreeMap<usize, usize>,
+    document: &'a Document,
     pos: &'a mut usize,
     path: Path<'a>,
     remaining_depth: u8,
 }
 
 impl<'a> DeserializerFromEvents<'a> {
-    fn peek(&self) -> Result<(&'a Event, Marker)> {
-        match self.events.get(*self.pos) {
-            Some(event) => Ok((&event.0, event.1)),
-            None => Err(error::end_of_stream()),
+    fn peek_event(&self) -> Result<&'a Event> {
+        self.peek_event_mark().map(|(event, _mark)| event)
+    }
+
+    fn peek_event_mark(&self) -> Result<(&'a Event, Mark)> {
+        match self.document.events.get(*self.pos) {
+            Some((event, mark)) => Ok((event, *mark)),
+            None => Err(match &self.document.error {
+                Some(parse_error) => error::shared(Arc::clone(parse_error)),
+                None => error::end_of_stream(),
+            }),
         }
     }
 
-    fn next(&mut self) -> Result<(&'a Event, Marker)> {
-        self.opt_next().ok_or_else(error::end_of_stream)
+    fn next_event(&mut self) -> Result<&'a Event> {
+        self.next_event_mark().map(|(event, _mark)| event)
     }
 
-    fn opt_next(&mut self) -> Option<(&'a Event, Marker)> {
-        self.events.get(*self.pos).map(|event| {
+    fn next_event_mark(&mut self) -> Result<(&'a Event, Mark)> {
+        self.peek_event_mark().map(|(event, mark)| {
             *self.pos += 1;
-            (&event.0, event.1)
+            (event, mark)
         })
     }
 
-    fn jump(&'a self, pos: &'a mut usize) -> Result<DeserializerFromEvents<'a>> {
-        match self.aliases.get(pos) {
-            Some(&found) => {
-                *pos = found;
+    fn jump<'b>(&'b self, pos: &'b mut usize) -> Result<DeserializerFromEvents<'b>> {
+        match self.document.aliases.get(pos) {
+            Some(found) => {
+                *pos = *found;
                 Ok(DeserializerFromEvents {
-                    events: self.events,
-                    aliases: self.aliases,
+                    document: self.document,
                     pos,
                     path: Path::Alias { parent: &self.path },
                     remaining_depth: self.remaining_depth,
@@ -545,7 +457,7 @@ impl<'a> DeserializerFromEvents<'a> {
         }
     }
 
-    fn ignore_any(&mut self) {
+    fn ignore_any(&mut self) -> Result<()> {
         enum Nest {
             Sequence,
             Mapping,
@@ -553,8 +465,8 @@ impl<'a> DeserializerFromEvents<'a> {
 
         let mut stack = Vec::new();
 
-        while let Some((event, _)) = self.opt_next() {
-            match event {
+        loop {
+            match self.next_event()? {
                 Event::Alias(_) | Event::Scalar(_, _, _) => {}
                 Event::SequenceStart => {
                     stack.push(Nest::Sequence);
@@ -576,20 +488,16 @@ impl<'a> DeserializerFromEvents<'a> {
                 },
             }
             if stack.is_empty() {
-                return;
+                return Ok(());
             }
-        }
-
-        if !stack.is_empty() {
-            panic!("missing end event");
         }
     }
 
-    fn visit_sequence<'de, V>(&mut self, visitor: V) -> Result<V::Value>
+    fn visit_sequence<'de, V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        let (value, len) = self.recursion_check(|de| {
+        let (value, len) = self.recursion_check(mark, |de| {
             let mut seq = SeqAccess { de, len: 0 };
             let value = visitor.visit_seq(&mut seq)?;
             Ok((value, seq.len))
@@ -598,11 +506,11 @@ impl<'a> DeserializerFromEvents<'a> {
         Ok(value)
     }
 
-    fn visit_mapping<'de, V>(&mut self, visitor: V) -> Result<V::Value>
+    fn visit_mapping<'de, V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        let (value, len) = self.recursion_check(|de| {
+        let (value, len) = self.recursion_check(mark, |de| {
             let mut map = MapAccess {
                 de,
                 len: 0,
@@ -636,7 +544,10 @@ impl<'a> DeserializerFromEvents<'a> {
             while de::SeqAccess::next_element::<Ignore>(&mut seq)?.is_some() {}
             seq.len
         };
-        assert_eq!(Event::SequenceEnd, *self.next()?.0);
+        match self.next_event()? {
+            Event::SequenceEnd => {}
+            _ => panic!("expected a SequenceEnd event"),
+        }
         if total == len {
             Ok(())
         } else {
@@ -664,7 +575,10 @@ impl<'a> DeserializerFromEvents<'a> {
             while de::MapAccess::next_entry::<Ignore, Ignore>(&mut map)?.is_some() {}
             map.len
         };
-        assert_eq!(Event::MappingEnd, *self.next()?.0);
+        match self.next_event()? {
+            Event::MappingEnd => {}
+            _ => panic!("expected a MappingEnd event"),
+        }
         if total == len {
             Ok(())
         } else {
@@ -682,11 +596,16 @@ impl<'a> DeserializerFromEvents<'a> {
         }
     }
 
-    fn recursion_check<F: FnOnce(&mut Self) -> Result<T>, T>(&mut self, f: F) -> Result<T> {
+    fn recursion_check<F: FnOnce(&mut Self) -> Result<T>, T>(
+        &mut self,
+        mark: Mark,
+        f: F,
+    ) -> Result<T> {
         let previous_depth = self.remaining_depth;
-        self.remaining_depth = previous_depth
-            .checked_sub(1)
-            .ok_or_else(error::recursion_limit_exceeded)?;
+        self.remaining_depth = match previous_depth.checked_sub(1) {
+            Some(depth) => depth,
+            None => return Err(error::recursion_limit_exceeded(mark)),
+        };
         let result = f(self);
         self.remaining_depth = previous_depth;
         result
@@ -694,42 +613,46 @@ impl<'a> DeserializerFromEvents<'a> {
 }
 
 fn visit_scalar<'de, V>(
-    v: &str,
-    style: TScalarStyle,
-    tag: &Option<TokenType>,
+    v: &[u8],
+    style: ScalarStyle,
+    tag: &Option<Tag>,
     visitor: V,
 ) -> Result<V::Value>
 where
     V: Visitor<'de>,
 {
-    if style != TScalarStyle::Plain {
-        visitor.visit_str(v)
-    } else if let Some(TokenType::Tag(handle, suffix)) = tag {
-        if handle == "!!" {
-            match suffix.as_ref() {
-                "bool" => match v.parse::<bool>() {
-                    Ok(v) => visitor.visit_bool(v),
-                    Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"a boolean")),
-                },
-                "int" => match v.parse::<i64>() {
-                    Ok(v) => visitor.visit_i64(v),
-                    Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"an integer")),
-                },
-                "float" => match v.parse::<f64>() {
-                    Ok(v) => visitor.visit_f64(v),
-                    Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"a float")),
-                },
-                "null" => match v {
-                    "~" | "null" => visitor.visit_unit(),
-                    _ => Err(de::Error::invalid_value(Unexpected::Str(v), &"null")),
-                },
-                _ => visitor.visit_str(v),
+    let v = match str::from_utf8(v) {
+        Ok(v) => v,
+        Err(_) => return Err(de::Error::invalid_type(Unexpected::Bytes(v), &visitor)),
+    };
+    if let Some(tag) = tag {
+        if tag == Tag::BOOL {
+            match v.parse::<bool>() {
+                Ok(v) => visitor.visit_bool(v),
+                Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"a boolean")),
+            }
+        } else if tag == Tag::INT {
+            match v.parse::<i64>() {
+                Ok(v) => visitor.visit_i64(v),
+                Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"an integer")),
+            }
+        } else if tag == Tag::FLOAT {
+            match v.parse::<f64>() {
+                Ok(v) => visitor.visit_f64(v),
+                Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"a float")),
+            }
+        } else if tag == Tag::NULL {
+            match v {
+                "~" | "null" => visitor.visit_unit(),
+                _ => Err(de::Error::invalid_value(Unexpected::Str(v), &"null")),
             }
         } else {
             visitor.visit_str(v)
         }
-    } else {
+    } else if style == ScalarStyle::Plain {
         visit_untagged_str(visitor, v)
+    } else {
+        visitor.visit_str(v)
     }
 }
 
@@ -745,12 +668,11 @@ impl<'de, 'a, 'r> de::SeqAccess<'de> for SeqAccess<'a, 'r> {
     where
         T: DeserializeSeed<'de>,
     {
-        match self.de.peek()?.0 {
+        match self.de.peek_event()? {
             Event::SequenceEnd => Ok(None),
             _ => {
                 let mut element_de = DeserializerFromEvents {
-                    events: self.de.events,
-                    aliases: self.de.aliases,
+                    document: self.de.document,
                     pos: self.de.pos,
                     path: Path::Seq {
                         parent: &self.de.path,
@@ -768,7 +690,7 @@ impl<'de, 'a, 'r> de::SeqAccess<'de> for SeqAccess<'a, 'r> {
 struct MapAccess<'a: 'r, 'r> {
     de: &'r mut DeserializerFromEvents<'a>,
     len: usize,
-    key: Option<&'a str>,
+    key: Option<&'a [u8]>,
 }
 
 impl<'de, 'a, 'r> de::MapAccess<'de> for MapAccess<'a, 'r> {
@@ -778,7 +700,7 @@ impl<'de, 'a, 'r> de::MapAccess<'de> for MapAccess<'a, 'r> {
     where
         K: DeserializeSeed<'de>,
     {
-        match self.de.peek()?.0 {
+        match self.de.peek_event()? {
             Event::MappingEnd => Ok(None),
             Event::Scalar(key, _, _) => {
                 self.len += 1;
@@ -798,10 +720,9 @@ impl<'de, 'a, 'r> de::MapAccess<'de> for MapAccess<'a, 'r> {
         V: DeserializeSeed<'de>,
     {
         let mut value_de = DeserializerFromEvents {
-            events: self.de.events,
-            aliases: self.de.aliases,
+            document: self.de.document,
             pos: self.de.pos,
-            path: if let Some(key) = self.key {
+            path: if let Some(key) = self.key.and_then(|key| str::from_utf8(key).ok()) {
                 Path::Map {
                     parent: &self.de.path,
                     key,
@@ -1011,9 +932,12 @@ impl<'de, 'a, 'r> de::EnumAccess<'de> for EnumAccess<'a, 'r> {
         let variant = if let Some(tag) = self.tag {
             tag
         } else {
-            match self.de.next()?.0 {
-                Event::Scalar(s, _, _) => &**s,
-                _ => {
+            match match self.de.next_event()? {
+                Event::Scalar(bytes, _, _) => str::from_utf8(bytes).ok(),
+                _ => None,
+            } {
+                Some(variant) => variant,
+                None => {
                     *self.de.pos -= 1;
                     let bad = BadKey { name: self.name };
                     return Err(de::Deserializer::deserialize_any(&mut *self.de, bad).unwrap_err());
@@ -1024,8 +948,7 @@ impl<'de, 'a, 'r> de::EnumAccess<'de> for EnumAccess<'a, 'r> {
         let str_de = IntoDeserializer::<Error>::into_deserializer(variant);
         let ret = seed.deserialize(str_de)?;
         let variant_visitor = DeserializerFromEvents {
-            events: self.de.events,
-            aliases: self.de.aliases,
+            document: self.de.document,
             pos: self.de.pos,
             path: Path::Map {
                 parent: &self.de.path,
@@ -1124,6 +1047,9 @@ fn visit_untagged_str<'de, V>(visitor: V, v: &str) -> Result<V::Value>
 where
     V: Visitor<'de>,
 {
+    if v.is_empty() {
+        return visitor.visit_unit();
+    }
     if v == "~" || v == "null" {
         return visitor.visit_unit();
     }
@@ -1133,43 +1059,43 @@ where
     if v == "false" {
         return visitor.visit_bool(false);
     }
-    if v.starts_with("0x") || v.starts_with("+0x") {
-        let start = 2 + v.starts_with('+') as usize;
-        if let Ok(n) = u64::from_str_radix(&v[start..], 16) {
+    if let Some(rest) = Option::or(v.strip_prefix("0x"), v.strip_prefix("+0x")) {
+        if let Ok(n) = u64::from_str_radix(rest, 16) {
             return visitor.visit_u64(n);
         }
     }
-    if v.starts_with("-0x") {
-        let negative = format!("-{}", &v[3..]);
+    if let Some(rest) = v.strip_prefix("-0x") {
+        let negative = format!("-{}", rest);
         if let Ok(n) = i64::from_str_radix(&negative, 16) {
             return visitor.visit_i64(n);
         }
     }
-    if v.starts_with("0o") || v.starts_with("+0o") {
-        let start = 2 + v.starts_with('+') as usize;
-        if let Ok(n) = u64::from_str_radix(&v[start..], 8) {
+    if let Some(rest) = Option::or(v.strip_prefix("0o"), v.strip_prefix("+0o")) {
+        if let Ok(n) = u64::from_str_radix(rest, 8) {
             return visitor.visit_u64(n);
         }
     }
-    if v.starts_with("-0o") {
-        let negative = format!("-{}", &v[3..]);
+    if let Some(rest) = v.strip_prefix("-0o") {
+        let negative = format!("-{}", rest);
         if let Ok(n) = i64::from_str_radix(&negative, 8) {
             return visitor.visit_i64(n);
         }
     }
-    if v.starts_with("0b") || v.starts_with("+0b") {
-        let start = 2 + v.starts_with('+') as usize;
-        if let Ok(n) = u64::from_str_radix(&v[start..], 2) {
+    if let Some(rest) = Option::or(v.strip_prefix("0b"), v.strip_prefix("+0b")) {
+        if let Ok(n) = u64::from_str_radix(rest, 2) {
             return visitor.visit_u64(n);
         }
     }
-    if v.starts_with("-0b") {
-        let negative = format!("-{}", &v[3..]);
+    if let Some(rest) = v.strip_prefix("-0b") {
+        let negative = format!("-{}", rest);
         if let Ok(n) = i64::from_str_radix(&negative, 2) {
             return visitor.visit_i64(n);
         }
     }
-    if v.len() > 1 && v.starts_with('0') && v.bytes().all(|b| b.is_ascii_digit()) {
+    if {
+        let v = v.trim_start_matches(&['-', '+'][..]);
+        v.len() > 1 && v.starts_with('0') && v[1..].bytes().all(|b| b.is_ascii_digit())
+    } {
         // After handling the different number encodings above if we are left
         // with leading zero(s) followed by numeric characters this is in fact a
         // string according to the YAML 1.2 spec.
@@ -1179,20 +1105,16 @@ where
     if let Ok(n) = v.parse() {
         return visitor.visit_u64(n);
     }
-    serde_if_integer128! {
-        if let Ok(n) = v.parse() {
-            return visitor.visit_u128(n);
-        }
+    if let Ok(n) = v.parse() {
+        return visitor.visit_u128(n);
     }
     if let Ok(n) = v.parse() {
         return visitor.visit_i64(n);
     }
-    serde_if_integer128! {
-        if let Ok(n) = v.parse() {
-            return visitor.visit_i128(n);
-        }
+    if let Ok(n) = v.parse() {
+        return visitor.visit_i128(n);
     }
-    match trim_start_matches(v, '+') {
+    match v.trim_start_matches('+') {
         ".inf" | ".Inf" | ".INF" => return visitor.visit_f64(f64::INFINITY),
         _ => (),
     }
@@ -1208,14 +1130,6 @@ where
         }
     }
     visitor.visit_str(v)
-}
-
-#[allow(deprecated)]
-fn trim_start_matches(s: &str, pat: char) -> &str {
-    // str::trim_start_matches was added in 1.30, trim_left_matches deprecated
-    // in 1.33. We currently support rustc back to 1.17 so we need to continue
-    // to use the deprecated one.
-    s.trim_left_matches(pat)
 }
 
 fn invalid_type(event: &Event, exp: &dyn Expected) -> Error {
@@ -1254,13 +1168,13 @@ impl<'a> DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        let (next, marker) = self.next()?;
+        let (next, mark) = self.next_event_mark()?;
         match next {
             Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_scalar(visitor),
             Event::Scalar(v, style, tag) => visit_scalar(v, *style, tag, visitor),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err| error::fix_marker(err, marker, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 }
 
@@ -1271,18 +1185,18 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        let (next, marker) = self.next()?;
+        let (next, mark) = self.next_event_mark()?;
         match next {
             Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_any(visitor),
             Event::Scalar(v, style, tag) => visit_scalar(v, *style, tag, visitor),
-            Event::SequenceStart => self.visit_sequence(visitor),
-            Event::MappingStart => self.visit_mapping(visitor),
+            Event::SequenceStart => self.visit_sequence(visitor, mark),
+            Event::MappingStart => self.visit_mapping(visitor, mark),
             Event::SequenceEnd => panic!("unexpected end of sequence"),
             Event::MappingEnd => panic!("unexpected end of mapping"),
         }
         // The de::Error impl creates errors with unknown line and column. Fill
         // in the position here by looking at the current index in the input.
-        .map_err(|err| error::fix_marker(err, marker, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
@@ -1320,13 +1234,11 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
         self.deserialize_scalar(visitor)
     }
 
-    serde_if_integer128! {
-        fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
-        where
-            V: Visitor<'de>,
-        {
-            self.deserialize_scalar(visitor)
-        }
+    fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_scalar(visitor)
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
@@ -1357,13 +1269,11 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
         self.deserialize_scalar(visitor)
     }
 
-    serde_if_integer128! {
-        fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
-        where
-            V: Visitor<'de>,
-        {
-            self.deserialize_scalar(visitor)
-        }
+    fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_scalar(visitor)
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
@@ -1391,13 +1301,19 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        let (next, marker) = self.next()?;
+        let (next, mark) = self.next_event_mark()?;
         match next {
-            Event::Scalar(v, _, _) => visitor.visit_str(v),
+            Event::Scalar(v, _, _) => {
+                if let Ok(v) = str::from_utf8(v) {
+                    visitor.visit_str(v)
+                } else {
+                    Err(invalid_type(next, &visitor))
+                }
+            }
             Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_str(visitor),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err: Error| error::fix_marker(err, marker, self.path))
+        .map_err(|err: Error| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_string<V>(self, visitor: V) -> Result<V::Value>
@@ -1426,26 +1342,28 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        let is_some = match self.peek()?.0 {
+        let is_some = match self.peek_event()? {
             Event::Alias(mut pos) => {
                 *self.pos += 1;
                 return self.jump(&mut pos)?.deserialize_option(visitor);
             }
             Event::Scalar(v, style, tag) => {
-                if *style != TScalarStyle::Plain {
+                if *style != ScalarStyle::Plain {
                     true
-                } else if let Some(TokenType::Tag(handle, suffix)) = tag {
-                    if handle == "!!" && suffix == "null" {
-                        if v == "~" || v == "null" {
+                } else if let Some(tag) = tag {
+                    if tag == Tag::NULL {
+                        if **v == *b"~" || **v == *b"null" {
                             false
-                        } else {
+                        } else if let Ok(v) = str::from_utf8(v) {
                             return Err(de::Error::invalid_value(Unexpected::Str(v), &"null"));
+                        } else {
+                            return Err(de::Error::invalid_value(Unexpected::Bytes(v), &"null"));
                         }
                     } else {
                         true
                     }
                 } else {
-                    v != "~" && v != "null"
+                    **v != *b"" && **v != *b"~" && **v != *b"null"
                 }
             }
             Event::SequenceStart | Event::MappingStart => true,
@@ -1486,13 +1404,13 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        let (next, marker) = self.next()?;
+        let (next, mark) = self.next_event_mark()?;
         match next {
             Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_seq(visitor),
-            Event::SequenceStart => self.visit_sequence(visitor),
+            Event::SequenceStart => self.visit_sequence(visitor, mark),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err| error::fix_marker(err, marker, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value>
@@ -1518,13 +1436,13 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        let (next, marker) = self.next()?;
+        let (next, mark) = self.next_event_mark()?;
         match next {
             Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_map(visitor),
-            Event::MappingStart => self.visit_mapping(visitor),
+            Event::MappingStart => self.visit_mapping(visitor, mark),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err| error::fix_marker(err, marker, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_struct<V>(
@@ -1540,16 +1458,16 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
             return self.visit_spanned(visitor);
         }
 
-        let (next, marker) = self.next()?;
+        let (next, mark) = self.next_event_mark()?;
         match next {
             Event::Alias(mut pos) => self
                 .jump(&mut pos)?
                 .deserialize_struct(name, fields, visitor),
-            Event::SequenceStart => self.visit_sequence(visitor),
-            Event::MappingStart => self.visit_mapping(visitor),
+            Event::SequenceStart => self.visit_sequence(visitor, mark),
+            Event::MappingStart => self.visit_mapping(visitor, mark),
             other => Err(invalid_type(other, &visitor)),
         }
-        .map_err(|err| error::fix_marker(err, marker, self.path))
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     /// Parses an enum as a single key:value pair where the key identifies the
@@ -1564,23 +1482,21 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        let (next, marker) = self.peek()?;
+        let (next, mark) = self.peek_event_mark()?;
         match next {
             Event::Alias(mut pos) => {
                 *self.pos += 1;
                 self.jump(&mut pos)?
                     .deserialize_enum(name, variants, visitor)
             }
-            Event::Scalar(_, _, t) => {
-                if let Some(TokenType::Tag(handle, suffix)) = t {
-                    if handle == "!" {
-                        if let Some(tag) = variants.iter().find(|v| *v == suffix) {
-                            return visitor.visit_enum(EnumAccess {
-                                de: self,
-                                name,
-                                tag: Some(tag),
-                            });
-                        }
+            Event::Scalar(_, _, tag) => {
+                if let Some((b'!', tag)) = tag.as_ref().and_then(|tag| tag.split_first()) {
+                    if let Some(tag) = variants.iter().find(|v| v.as_bytes() == tag) {
+                        return visitor.visit_enum(EnumAccess {
+                            de: self,
+                            name,
+                            tag: Some(tag),
+                        });
                     }
                 }
                 visitor.visit_enum(UnitVariantAccess { de: self })
@@ -1597,7 +1513,7 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
             }
             Event::SequenceStart => {
                 let err = de::Error::invalid_type(Unexpected::Seq, &"string or singleton map");
-                Err(error::fix_marker(err, marker, self.path))
+                Err(error::fix_mark(err, mark, self.path))
             }
             Event::SequenceEnd => panic!("unexpected end of sequence"),
             Event::MappingEnd => panic!("unexpected end of mapping"),
@@ -1615,7 +1531,7 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        self.ignore_any();
+        self.ignore_any()?;
         visitor.visit_unit()
     }
 }
