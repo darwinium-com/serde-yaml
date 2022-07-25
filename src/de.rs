@@ -712,14 +712,22 @@ struct SpannedMapAccess<'de, 'document, 'variant> {
 
 impl<'de, 'document, 'variant> SpannedMapAccess<'de, 'document, 'variant> {
     fn start_location(&self) -> Result<usize> {
-        let (_event, marker) = self
+        let (event, marker) = self
             .de
             .document
             .events
             .get(self.pos)
             .ok_or_else(crate::error::end_of_stream)?;
 
-        Ok(marker.index() as usize)
+        let mut index = marker.index() as usize; 
+
+        if let Event::Scalar(scalar) = event {
+            if matches!(scalar.style, ScalarStyle::SingleQuoted | ScalarStyle::DoubleQuoted) {
+                index += 1;
+            }
+        }
+
+        Ok(index)
     }
 
     fn index_of_sequence_end(&self) -> Result<usize> {
