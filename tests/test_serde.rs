@@ -9,7 +9,6 @@ use indoc::indoc;
 use serde_derive::{Deserialize, Serialize};
 use serde_yaml::Value;
 use std::collections::BTreeMap;
-use std::f64;
 use std::fmt::Debug;
 
 fn test_serde<T>(thing: &T, yaml: &str)
@@ -49,7 +48,7 @@ fn test_int() {
 
 #[test]
 fn test_int_max_u64() {
-    let thing = ::std::u64::MAX;
+    let thing = u64::MAX;
     let yaml = indoc! {"
         18446744073709551615
     "};
@@ -58,7 +57,7 @@ fn test_int_max_u64() {
 
 #[test]
 fn test_int_min_i64() {
-    let thing = ::std::i64::MIN;
+    let thing = i64::MIN;
     let yaml = indoc! {"
         -9223372036854775808
     "};
@@ -67,7 +66,7 @@ fn test_int_min_i64() {
 
 #[test]
 fn test_int_max_i64() {
-    let thing = ::std::i64::MAX;
+    let thing = i64::MAX;
     let yaml = indoc! {"
         9223372036854775807
     "};
@@ -166,8 +165,8 @@ fn test_vec() {
 #[test]
 fn test_map() {
     let mut thing = BTreeMap::new();
-    thing.insert(String::from("x"), 1);
-    thing.insert(String::from("y"), 2);
+    thing.insert("x".to_owned(), 1);
+    thing.insert("y".to_owned(), 2);
     let yaml = indoc! {"
         x: 1
         y: 2
@@ -185,13 +184,56 @@ fn test_basic_struct() {
     }
     let thing = Basic {
         x: -4,
-        y: String::from("hi\tquoted"),
+        y: "hi\tquoted".to_owned(),
         z: true,
     };
     let yaml = indoc! {r#"
         x: -4
         y: "hi\tquoted"
         z: true
+    "#};
+    test_serde(&thing, yaml);
+}
+
+#[test]
+fn test_multiline_string() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Struct {
+        trailing_newline: String,
+        no_trailing_newline: String,
+    }
+    let thing = Struct {
+        trailing_newline: "aaa\nbbb\n".to_owned(),
+        no_trailing_newline: "aaa\nbbb".to_owned(),
+    };
+    let yaml = indoc! {r#"
+        trailing_newline: |
+          aaa
+          bbb
+        no_trailing_newline: |-
+          aaa
+          bbb
+    "#};
+    test_serde(&thing, yaml);
+}
+
+#[test]
+fn test_strings_needing_quote() {
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Struct {
+        boolean: String,
+        integer: String,
+        void: String,
+    }
+    let thing = Struct {
+        boolean: "true".to_owned(),
+        integer: "1".to_owned(),
+        void: "null".to_owned(),
+    };
+    let yaml = indoc! {r#"
+        boolean: 'true'
+        integer: '1'
+        void: 'null'
     "#};
     test_serde(&thing, yaml);
 }

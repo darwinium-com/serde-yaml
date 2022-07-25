@@ -1,8 +1,9 @@
-use crate::libyaml::cstr::CStr;
+use crate::libyaml::cstr::{self, CStr};
 use crate::libyaml::error::{Error, Mark, Result};
 use crate::libyaml::tag::Tag;
 use crate::libyaml::util::Owned;
 use std::borrow::Cow;
+use std::fmt::{self, Debug};
 use std::mem::MaybeUninit;
 use std::ptr::{addr_of_mut, NonNull};
 use std::slice;
@@ -17,30 +18,34 @@ struct ParserPinned<'input> {
     input: Cow<'input, [u8]>,
 }
 
-pub(crate) enum Event {
+#[derive(Debug)]
+pub(crate) enum Event<'input> {
     StreamStart,
     StreamEnd,
     DocumentStart,
     DocumentEnd,
     Alias(Anchor),
-    Scalar(Scalar),
+    Scalar(Scalar<'input>),
     SequenceStart(SequenceStart),
     SequenceEnd,
     MappingStart(MappingStart),
     MappingEnd,
 }
 
-pub(crate) struct Scalar {
+pub(crate) struct Scalar<'input> {
     pub anchor: Option<Anchor>,
     pub tag: Option<Tag>,
     pub value: Box<[u8]>,
     pub style: ScalarStyle,
+    pub repr: Option<&'input [u8]>,
 }
 
+#[derive(Debug)]
 pub(crate) struct SequenceStart {
     pub anchor: Option<Anchor>,
 }
 
+#[derive(Debug)]
 pub(crate) struct MappingStart {
     pub anchor: Option<Anchor>,
 }
@@ -62,7 +67,7 @@ impl<'input> Parser<'input> {
         let owned = Owned::<ParserPinned>::new_uninit();
         let pin = unsafe {
             let parser = addr_of_mut!((*owned.ptr).sys);
-            if sys::yaml_parser_initialize(parser) == 0 {
+            if sys::yaml_parser_initialize(parser).fail {
                 panic!("malloc error: {}", Error::parse_error(parser));
             }
             sys::yaml_parser_set_encoding(parser, sys::YAML_UTF8_ENCODING);
@@ -73,15 +78,15 @@ impl<'input> Parser<'input> {
         Parser { pin }
     }
 
-    pub fn next(&mut self) -> Result<(Event, Mark)> {
+    pub fn next(&mut self) -> Result<(Event<'input>, Mark)> {
         let mut event = MaybeUninit::<sys::yaml_event_t>::uninit();
         unsafe {
             let parser = addr_of_mut!((*self.pin.ptr).sys);
             let event = event.as_mut_ptr();
-            if sys::yaml_parser_parse(parser, event) == 0 {
+            if sys::yaml_parser_parse(parser, event).fail {
                 return Err(Error::parse_error(parser));
             }
-            let ret = convert_event(&*event);
+            let ret = convert_event(&*event, &(*self.pin.ptr).input);
             let mark = Mark {
                 sys: (*event).start_mark,
             };
@@ -91,7 +96,10 @@ impl<'input> Parser<'input> {
     }
 }
 
-unsafe fn convert_event(sys: &sys::yaml_event_t) -> Event {
+unsafe fn convert_event<'input>(
+    sys: &sys::yaml_event_t,
+    input: &Cow<'input, [u8]>,
+) -> Event<'input> {
     match sys.type_ {
         sys::YAML_STREAM_START_EVENT => Event::StreamStart,
         sys::YAML_STREAM_END_EVENT => Event::StreamEnd,
@@ -112,6 +120,11 @@ unsafe fn convert_event(sys: &sys::yaml_event_t) -> Event {
                 sys::YAML_LITERAL_SCALAR_STYLE => ScalarStyle::Literal,
                 sys::YAML_FOLDED_SCALAR_STYLE => ScalarStyle::Folded,
                 sys::YAML_ANY_SCALAR_STYLE | _ => unreachable!(),
+            },
+            repr: if let Cow::Borrowed(input) = input {
+                Some(&input[sys.start_mark.index as usize..sys.end_mark.index as usize])
+            } else {
+                None
             },
         }),
         sys::YAML_SEQUENCE_START_EVENT => Event::SequenceStart(SequenceStart {
@@ -137,6 +150,40 @@ unsafe fn optional_tag(tag: *const u8) -> Option<Tag> {
     let ptr = NonNull::new(tag as *mut i8)?;
     let cstr = CStr::from_ptr(ptr);
     Some(Tag(Box::from(cstr.to_bytes())))
+}
+
+impl<'input> Debug for Scalar<'input> {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        let Scalar {
+            anchor,
+            tag,
+            value,
+            style,
+            repr: _,
+        } = self;
+
+        struct LossySlice<'a>(&'a [u8]);
+
+        impl<'a> Debug for LossySlice<'a> {
+            fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                cstr::debug_lossy(self.0, formatter)
+            }
+        }
+
+        formatter
+            .debug_struct("Scalar")
+            .field("anchor", anchor)
+            .field("tag", tag)
+            .field("value", &LossySlice(value))
+            .field("style", style)
+            .finish()
+    }
+}
+
+impl Debug for Anchor {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        cstr::debug_lossy(&self.0, formatter)
+    }
 }
 
 impl<'input> Drop for ParserPinned<'input> {

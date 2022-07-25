@@ -10,9 +10,9 @@ use serde_yaml::Value;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
-fn test_de<T>(yaml: &str, expected: &T)
+fn test_de<'de, T>(yaml: &'de str, expected: &T)
 where
-    T: serde::de::DeserializeOwned + PartialEq + Debug,
+    T: serde::de::Deserialize<'de> + PartialEq + Debug,
 {
     let deserialized: T = serde_yaml::from_str(yaml).unwrap();
     assert_eq!(*expected, deserialized);
@@ -21,16 +21,27 @@ where
     serde_yaml::from_str::<serde::de::IgnoredAny>(yaml).unwrap();
 }
 
-fn test_de_seed<T, S>(yaml: &str, seed: S, expected: &T)
+fn test_de_seed<'de, T, S>(yaml: &'de str, seed: S, expected: &T)
 where
     T: PartialEq + Debug,
-    S: for<'de> serde::de::DeserializeSeed<'de, Value = T>,
+    S: serde::de::DeserializeSeed<'de, Value = T>,
 {
     let deserialized: T = serde_yaml::seed::from_str_seed(yaml, seed).unwrap();
     assert_eq!(*expected, deserialized);
 
     serde_yaml::from_str::<serde_yaml::Value>(yaml).unwrap();
     serde_yaml::from_str::<serde::de::IgnoredAny>(yaml).unwrap();
+}
+
+#[test]
+fn test_borrowed() {
+    let yaml = indoc! {"
+        - plain nonàscii
+        - 'single quoted'
+        - \"double quoted\"
+    "};
+    let expected = vec!["plain nonàscii", "single quoted", "double quoted"];
+    test_de(yaml, &expected);
 }
 
 #[test]
@@ -44,11 +55,9 @@ fn test_alias() {
         third: 3
     "};
     let mut expected = BTreeMap::new();
-    {
-        expected.insert(String::from("first"), 1);
-        expected.insert(String::from("second"), 1);
-        expected.insert(String::from("third"), 3);
-    }
+    expected.insert("first".to_owned(), 1);
+    expected.insert("second".to_owned(), 1);
+    expected.insert("third".to_owned(), 3);
     test_de(yaml, &expected);
 }
 
@@ -195,20 +204,30 @@ fn test_number_as_string() {
 
 #[test]
 fn test_i128_big() {
-    let expected: i128 = ::std::i64::MIN as i128 - 1;
+    let expected: i128 = i64::MIN as i128 - 1;
     let yaml = indoc! {"
         -9223372036854775809
     "};
     assert_eq!(expected, serde_yaml::from_str::<i128>(yaml).unwrap());
+
+    let octal = indoc! {"
+        -0o1000000000000000000001
+    "};
+    assert_eq!(expected, serde_yaml::from_str::<i128>(octal).unwrap());
 }
 
 #[test]
 fn test_u128_big() {
-    let expected: u128 = ::std::u64::MAX as u128 + 1;
+    let expected: u128 = u64::MAX as u128 + 1;
     let yaml = indoc! {"
         18446744073709551616
     "};
     assert_eq!(expected, serde_yaml::from_str::<u128>(yaml).unwrap());
+
+    let octal = indoc! {"
+        0o2000000000000000000000
+    "};
+    assert_eq!(expected, serde_yaml::from_str::<u128>(octal).unwrap());
 }
 
 #[test]
@@ -337,7 +356,10 @@ fn test_numbers() {
     }
 
     // NOT numbers.
-    let cases = ["0127", "+0127", "-0127"];
+    let cases = [
+        "0127", "+0127", "-0127", "++.inf", "+-.inf", "++1", "+-1", "-+1", "--1", "0x+1", "0x-1",
+        "-0x+1", "-0x-1", "++0x1", "+-0x1", "-+0x1", "--0x1",
+    ];
     for yaml in &cases {
         let value = serde_yaml::from_str::<Value>(yaml).unwrap();
         match value {

@@ -10,8 +10,8 @@ pub(crate) struct Loader<'input> {
     parser: Option<Parser<'input>>,
 }
 
-pub(crate) struct Document {
-    pub events: Vec<(Event, Mark)>,
+pub(crate) struct Document<'input> {
+    pub events: Vec<(Event<'input>, Mark)>,
     pub error: Option<Arc<ErrorImpl>>,
     /// Map from alias id to index in events.
     pub aliases: BTreeMap<usize, usize>,
@@ -36,7 +36,7 @@ impl<'input> Loader<'input> {
         })
     }
 
-    pub fn next_document(&mut self) -> Option<Document> {
+    pub fn next_document(&mut self) -> Option<Document<'input>> {
         let parser = match &mut self.parser {
             Some(parser) => parser,
             None => return None,
@@ -72,13 +72,13 @@ impl<'input> Loader<'input> {
                         return Some(document);
                     }
                 },
-                YamlEvent::Scalar(scalar) => {
-                    if let Some(anchor) = scalar.anchor {
+                YamlEvent::Scalar(mut scalar) => {
+                    if let Some(anchor) = scalar.anchor.take() {
                         let id = anchors.len();
                         anchors.insert(anchor, id);
                         document.aliases.insert(id, document.events.len());
                     }
-                    Event::Scalar(scalar.value, scalar.style, scalar.tag)
+                    Event::Scalar(scalar)
                 }
                 YamlEvent::SequenceStart(sequence_start) => {
                     if let Some(anchor) = sequence_start.anchor {

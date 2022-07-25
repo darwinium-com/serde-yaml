@@ -1,6 +1,6 @@
-use crate::error::{self, Error, ErrorImpl, Result};
+use crate::error::{self, Error, ErrorImpl};
 use crate::libyaml::error::Mark;
-use crate::libyaml::parser::ScalarStyle;
+use crate::libyaml::parser::{Scalar, ScalarStyle};
 use crate::libyaml::tag::Tag;
 use crate::loader::{Document, Loader};
 use crate::path::Path;
@@ -8,13 +8,15 @@ use serde::de::{
     self, value::BorrowedStrDeserializer, Deserialize, DeserializeOwned, DeserializeSeed, Expected,
     IgnoredAny as Ignore, IntoDeserializer, Unexpected, Visitor,
 };
-use std::f64;
 use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
+use std::num::ParseIntError;
 use std::str;
 use std::sync::Arc;
+
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A structure that deserializes YAML into Rust values.
 ///
@@ -54,28 +56,28 @@ use std::sync::Arc;
 ///     Ok(())
 /// }
 /// ```
-pub struct Deserializer<'a> {
-    progress: Progress<'a>,
+pub struct Deserializer<'de> {
+    progress: Progress<'de>,
 }
 
-pub(crate) enum Progress<'a> {
-    Str(&'a str),
-    Slice(&'a [u8]),
-    Read(Box<dyn io::Read + 'a>),
-    Iterable(Loader<'a>),
-    Document(Document),
+pub(crate) enum Progress<'de> {
+    Str(&'de str),
+    Slice(&'de [u8]),
+    Read(Box<dyn io::Read + 'de>),
+    Iterable(Loader<'de>),
+    Document(Document<'de>),
     Fail(Arc<ErrorImpl>),
 }
 
-impl<'a> Deserializer<'a> {
+impl<'de> Deserializer<'de> {
     /// Creates a YAML deserializer from a `&str`.
-    pub fn from_str(s: &'a str) -> Self {
+    pub fn from_str(s: &'de str) -> Self {
         let progress = Progress::Str(s);
         Deserializer { progress }
     }
 
     /// Creates a YAML deserializer from a `&[u8]`.
-    pub fn from_slice(v: &'a [u8]) -> Self {
+    pub fn from_slice(v: &'de [u8]) -> Self {
         let progress = Progress::Slice(v);
         Deserializer { progress }
     }
@@ -87,13 +89,16 @@ impl<'a> Deserializer<'a> {
     /// -- everything it does involves copying bytes out of the data source.
     pub fn from_reader<R>(rdr: R) -> Self
     where
-        R: io::Read + 'a,
+        R: io::Read + 'de,
     {
         let progress = Progress::Read(Box::new(rdr));
         Deserializer { progress }
     }
 
-    fn de<T>(self, f: impl FnOnce(&mut DeserializerFromEvents) -> Result<T>) -> Result<T> {
+    fn de<T>(
+        self,
+        f: impl for<'document> FnOnce(&mut DeserializerFromEvents<'de, 'document>) -> Result<T>,
+    ) -> Result<T> {
         match &self.progress {
             Progress::Iterable(_) => return Err(error::more_than_one_document()),
             Progress::Document(document) => {
@@ -400,28 +405,29 @@ impl<'de> de::Deserializer<'de> for Deserializer<'de> {
     }
 }
 
-pub(crate) enum Event {
+#[derive(Debug)]
+pub(crate) enum Event<'de> {
     Alias(usize),
-    Scalar(Box<[u8]>, ScalarStyle, Option<Tag>),
+    Scalar(Scalar<'de>),
     SequenceStart,
     SequenceEnd,
     MappingStart,
     MappingEnd,
 }
 
-struct DeserializerFromEvents<'a> {
-    document: &'a Document,
-    pos: &'a mut usize,
-    path: Path<'a>,
+struct DeserializerFromEvents<'de, 'document> {
+    document: &'document Document<'de>,
+    pos: &'document mut usize,
+    path: Path<'document>,
     remaining_depth: u8,
 }
 
-impl<'a> DeserializerFromEvents<'a> {
-    fn peek_event(&self) -> Result<&'a Event> {
+impl<'de, 'document> DeserializerFromEvents<'de, 'document> {
+    fn peek_event(&self) -> Result<&'document Event<'de>> {
         self.peek_event_mark().map(|(event, _mark)| event)
     }
 
-    fn peek_event_mark(&self) -> Result<(&'a Event, Mark)> {
+    fn peek_event_mark(&self) -> Result<(&'document Event<'de>, Mark)> {
         match self.document.events.get(*self.pos) {
             Some((event, mark)) => Ok((event, *mark)),
             None => Err(match &self.document.error {
@@ -431,18 +437,21 @@ impl<'a> DeserializerFromEvents<'a> {
         }
     }
 
-    fn next_event(&mut self) -> Result<&'a Event> {
+    fn next_event(&mut self) -> Result<&'document Event<'de>> {
         self.next_event_mark().map(|(event, _mark)| event)
     }
 
-    fn next_event_mark(&mut self) -> Result<(&'a Event, Mark)> {
+    fn next_event_mark(&mut self) -> Result<(&'document Event<'de>, Mark)> {
         self.peek_event_mark().map(|(event, mark)| {
             *self.pos += 1;
             (event, mark)
         })
     }
 
-    fn jump<'b>(&'b self, pos: &'b mut usize) -> Result<DeserializerFromEvents<'b>> {
+    fn jump<'anchor>(
+        &'anchor self,
+        pos: &'anchor mut usize,
+    ) -> Result<DeserializerFromEvents<'de, 'anchor>> {
         match self.document.aliases.get(pos) {
             Some(found) => {
                 *pos = *found;
@@ -467,7 +476,7 @@ impl<'a> DeserializerFromEvents<'a> {
 
         loop {
             match self.next_event()? {
-                Event::Alias(_) | Event::Scalar(_, _, _) => {}
+                Event::Alias(_) | Event::Scalar(_) => {}
                 Event::SequenceStart => {
                     stack.push(Nest::Sequence);
                 }
@@ -493,7 +502,7 @@ impl<'a> DeserializerFromEvents<'a> {
         }
     }
 
-    fn visit_sequence<'de, V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
+    fn visit_sequence<V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
@@ -506,7 +515,7 @@ impl<'a> DeserializerFromEvents<'a> {
         Ok(value)
     }
 
-    fn visit_mapping<'de, V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
+    fn visit_mapping<V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
@@ -523,7 +532,7 @@ impl<'a> DeserializerFromEvents<'a> {
         Ok(value)
     }
 
-    fn visit_spanned<'de, V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
+    fn visit_spanned<V>(&mut self, visitor: V, mark: Mark) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
@@ -612,56 +621,12 @@ impl<'a> DeserializerFromEvents<'a> {
     }
 }
 
-fn visit_scalar<'de, V>(
-    v: &[u8],
-    style: ScalarStyle,
-    tag: &Option<Tag>,
-    visitor: V,
-) -> Result<V::Value>
-where
-    V: Visitor<'de>,
-{
-    let v = match str::from_utf8(v) {
-        Ok(v) => v,
-        Err(_) => return Err(de::Error::invalid_type(Unexpected::Bytes(v), &visitor)),
-    };
-    if let Some(tag) = tag {
-        if tag == Tag::BOOL {
-            match v.parse::<bool>() {
-                Ok(v) => visitor.visit_bool(v),
-                Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"a boolean")),
-            }
-        } else if tag == Tag::INT {
-            match v.parse::<i64>() {
-                Ok(v) => visitor.visit_i64(v),
-                Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"an integer")),
-            }
-        } else if tag == Tag::FLOAT {
-            match v.parse::<f64>() {
-                Ok(v) => visitor.visit_f64(v),
-                Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"a float")),
-            }
-        } else if tag == Tag::NULL {
-            match v {
-                "~" | "null" => visitor.visit_unit(),
-                _ => Err(de::Error::invalid_value(Unexpected::Str(v), &"null")),
-            }
-        } else {
-            visitor.visit_str(v)
-        }
-    } else if style == ScalarStyle::Plain {
-        visit_untagged_str(visitor, v)
-    } else {
-        visitor.visit_str(v)
-    }
-}
-
-struct SeqAccess<'a: 'r, 'r> {
-    de: &'r mut DeserializerFromEvents<'a>,
+struct SeqAccess<'de, 'document, 'seq> {
+    de: &'seq mut DeserializerFromEvents<'de, 'document>,
     len: usize,
 }
 
-impl<'de, 'a, 'r> de::SeqAccess<'de> for SeqAccess<'a, 'r> {
+impl<'de, 'document, 'seq> de::SeqAccess<'de> for SeqAccess<'de, 'document, 'seq> {
     type Error = Error;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
@@ -687,13 +652,13 @@ impl<'de, 'a, 'r> de::SeqAccess<'de> for SeqAccess<'a, 'r> {
     }
 }
 
-struct MapAccess<'a: 'r, 'r> {
-    de: &'r mut DeserializerFromEvents<'a>,
+struct MapAccess<'de, 'document, 'map> {
+    de: &'map mut DeserializerFromEvents<'de, 'document>,
     len: usize,
-    key: Option<&'a [u8]>,
+    key: Option<&'document [u8]>,
 }
 
-impl<'de, 'a, 'r> de::MapAccess<'de> for MapAccess<'a, 'r> {
+impl<'de, 'document, 'map> de::MapAccess<'de> for MapAccess<'de, 'document, 'map> {
     type Error = Error;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
@@ -702,9 +667,9 @@ impl<'de, 'a, 'r> de::MapAccess<'de> for MapAccess<'a, 'r> {
     {
         match self.de.peek_event()? {
             Event::MappingEnd => Ok(None),
-            Event::Scalar(key, _, _) => {
+            Event::Scalar(scalar) => {
                 self.len += 1;
-                self.key = Some(key);
+                self.key = Some(&scalar.value);
                 seed.deserialize(&mut *self.de).map(Some)
             }
             _ => {
@@ -738,13 +703,14 @@ impl<'de, 'a, 'r> de::MapAccess<'de> for MapAccess<'a, 'r> {
     }
 }
 
-struct SpannedMapAccess<'a: 'r, 'r> {
-    de: &'r mut DeserializerFromEvents<'a>,
+
+struct SpannedMapAccess<'de, 'document, 'variant> {
+    de: &'variant mut DeserializerFromEvents<'de, 'document>,
     pos: usize,
     state: SpannedMapAccessState,
 }
 
-impl<'de, 'a, 'r> SpannedMapAccess<'a, 'r> {
+impl<'de, 'document, 'variant> SpannedMapAccess<'de, 'document, 'variant> {
     fn start_location(&self) -> Result<usize> {
         let (_event, marker) = self
             .de
@@ -810,7 +776,7 @@ impl<'de, 'a, 'r> SpannedMapAccess<'a, 'r> {
         let length = match event {
             // just add the length of the token. Don't forget to subtract by 1
             // because of our inclusive end bound.
-            Event::Scalar(token, _, _) => token.len(),
+            Event::Scalar(token) => token.value.len(),
             // find the index of the end token
             Event::SequenceStart => self.index_of_sequence_end()? - marker.index() as usize,
             // find the index of the end token
@@ -822,7 +788,7 @@ impl<'de, 'a, 'r> SpannedMapAccess<'a, 'r> {
     }
 }
 
-impl<'de, 'a, 'r> de::MapAccess<'de> for SpannedMapAccess<'a, 'r> {
+impl<'de, 'document, 'variant> de::MapAccess<'de> for SpannedMapAccess<'de, 'document, 'variant> {
     type Error = Error;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
@@ -901,15 +867,15 @@ enum SpannedMapAccessState {
     Done,
 }
 
-struct EnumAccess<'a: 'r, 'r> {
-    de: &'r mut DeserializerFromEvents<'a>,
+struct EnumAccess<'de, 'document, 'variant> {
+    de: &'variant mut DeserializerFromEvents<'de, 'document>,
     name: &'static str,
     tag: Option<&'static str>,
 }
 
-impl<'de, 'a, 'r> de::EnumAccess<'de> for EnumAccess<'a, 'r> {
+impl<'de, 'document, 'variant> de::EnumAccess<'de> for EnumAccess<'de, 'document, 'variant> {
     type Error = Error;
-    type Variant = DeserializerFromEvents<'r>;
+    type Variant = DeserializerFromEvents<'de, 'variant>;
 
     fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant)>
     where
@@ -934,7 +900,7 @@ impl<'de, 'a, 'r> de::EnumAccess<'de> for EnumAccess<'a, 'r> {
             tag
         } else {
             match match self.de.next_event()? {
-                Event::Scalar(bytes, _, _) => str::from_utf8(bytes).ok(),
+                Event::Scalar(scalar) => str::from_utf8(&scalar.value).ok(),
                 Event::MappingEnd => {
                     let bad = BadKey { name: self.name };
                     return Err(de::Error::invalid_type(
@@ -975,7 +941,7 @@ impl<'de, 'a, 'r> de::EnumAccess<'de> for EnumAccess<'a, 'r> {
     }
 }
 
-impl<'de, 'a> de::VariantAccess<'de> for DeserializerFromEvents<'a> {
+impl<'de, 'document> de::VariantAccess<'de> for DeserializerFromEvents<'de, 'document> {
     type Error = Error;
 
     fn unit_variant(mut self) -> Result<()> {
@@ -1004,11 +970,11 @@ impl<'de, 'a> de::VariantAccess<'de> for DeserializerFromEvents<'a> {
     }
 }
 
-struct UnitVariantAccess<'a: 'r, 'r> {
-    de: &'r mut DeserializerFromEvents<'a>,
+struct UnitVariantAccess<'de, 'document, 'variant> {
+    de: &'variant mut DeserializerFromEvents<'de, 'document>,
 }
 
-impl<'de, 'a, 'r> de::EnumAccess<'de> for UnitVariantAccess<'a, 'r> {
+impl<'de, 'document, 'variant> de::EnumAccess<'de> for UnitVariantAccess<'de, 'document, 'variant> {
     type Error = Error;
     type Variant = Self;
 
@@ -1020,7 +986,9 @@ impl<'de, 'a, 'r> de::EnumAccess<'de> for UnitVariantAccess<'a, 'r> {
     }
 }
 
-impl<'de, 'a, 'r> de::VariantAccess<'de> for UnitVariantAccess<'a, 'r> {
+impl<'de, 'document, 'variant> de::VariantAccess<'de>
+    for UnitVariantAccess<'de, 'document, 'variant>
+{
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
@@ -1058,93 +1026,296 @@ impl<'de, 'a, 'r> de::VariantAccess<'de> for UnitVariantAccess<'a, 'r> {
     }
 }
 
-fn visit_untagged_str<'de, V>(visitor: V, v: &str) -> Result<V::Value>
+fn visit_scalar<'de, V>(visitor: V, scalar: &Scalar<'de>) -> Result<V::Value>
 where
     V: Visitor<'de>,
 {
-    if v.is_empty() {
+    let v = match str::from_utf8(&scalar.value) {
+        Ok(v) => v,
+        Err(_) => {
+            return Err(de::Error::invalid_type(
+                Unexpected::Bytes(&scalar.value),
+                &visitor,
+            ))
+        }
+    };
+    if let Some(tag) = &scalar.tag {
+        if tag == Tag::BOOL {
+            return match parse_bool(v) {
+                Some(v) => visitor.visit_bool(v),
+                None => Err(de::Error::invalid_value(Unexpected::Str(v), &"a boolean")),
+            };
+        } else if tag == Tag::INT {
+            return match visit_int(visitor, v) {
+                Ok(result) => result,
+                Err(_) => Err(de::Error::invalid_value(Unexpected::Str(v), &"an integer")),
+            };
+        } else if tag == Tag::FLOAT {
+            return match parse_f64(v) {
+                Some(v) => visitor.visit_f64(v),
+                None => Err(de::Error::invalid_value(Unexpected::Str(v), &"a float")),
+            };
+        } else if tag == Tag::NULL {
+            return match parse_null(v.as_bytes()) {
+                Some(()) => visitor.visit_unit(),
+                None => Err(de::Error::invalid_value(Unexpected::Str(v), &"null")),
+            };
+        }
+    } else if scalar.style == ScalarStyle::Plain {
+        return visit_untagged_scalar(visitor, v, scalar.repr, scalar.style);
+    }
+    if let Some(borrowed) = parse_borrowed_str(v, scalar.repr, scalar.style) {
+        visitor.visit_borrowed_str(borrowed)
+    } else {
+        visitor.visit_str(v)
+    }
+}
+
+fn parse_borrowed_str<'de>(
+    utf8_value: &str,
+    repr: Option<&'de [u8]>,
+    style: ScalarStyle,
+) -> Option<&'de str> {
+    let borrowed_repr = repr?;
+    let expected_offset = match style {
+        ScalarStyle::Plain => 0,
+        ScalarStyle::SingleQuoted | ScalarStyle::DoubleQuoted => 1,
+        ScalarStyle::Literal | ScalarStyle::Folded => return None,
+    };
+    let expected_end = borrowed_repr.len().checked_sub(expected_offset)?;
+    let expected_start = expected_end.checked_sub(utf8_value.len())?;
+    let borrowed_bytes = borrowed_repr.get(expected_start..expected_end)?;
+    if borrowed_bytes == utf8_value.as_bytes() {
+        return Some(unsafe { str::from_utf8_unchecked(borrowed_bytes) });
+    }
+    None
+}
+
+fn parse_null(scalar: &[u8]) -> Option<()> {
+    if scalar == b"~" || scalar == b"null" {
+        Some(())
+    } else {
+        None
+    }
+}
+
+fn parse_bool(scalar: &str) -> Option<bool> {
+    if scalar == "true" {
+        Some(true)
+    } else if scalar == "false" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn parse_unsigned_int<T>(
+    scalar: &str,
+    from_str_radix: fn(&str, radix: u32) -> Result<T, ParseIntError>,
+) -> Option<T> {
+    let unpositive = scalar.strip_prefix('+').unwrap_or(scalar);
+    if let Some(rest) = unpositive.strip_prefix("0x") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        if let Ok(int) = from_str_radix(rest, 16) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = unpositive.strip_prefix("0o") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        if let Ok(int) = from_str_radix(rest, 8) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = unpositive.strip_prefix("0b") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        if let Ok(int) = from_str_radix(rest, 2) {
+            return Some(int);
+        }
+    }
+    if unpositive.starts_with(['+', '-']) {
+        return None;
+    }
+    if digits_but_not_number(scalar) {
+        return None;
+    }
+    from_str_radix(unpositive, 10).ok()
+}
+
+fn parse_signed_int<T>(
+    scalar: &str,
+    from_str_radix: fn(&str, radix: u32) -> Result<T, ParseIntError>,
+) -> Option<T> {
+    let unpositive = if let Some(unpositive) = scalar.strip_prefix('+') {
+        if unpositive.starts_with(['+', '-']) {
+            return None;
+        }
+        unpositive
+    } else {
+        scalar
+    };
+    if let Some(rest) = unpositive.strip_prefix("0x") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        if let Ok(int) = from_str_radix(rest, 16) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = scalar.strip_prefix("-0x") {
+        let negative = format!("-{}", rest);
+        if let Ok(int) = from_str_radix(&negative, 16) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = unpositive.strip_prefix("0o") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        if let Ok(int) = from_str_radix(rest, 8) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = scalar.strip_prefix("-0o") {
+        let negative = format!("-{}", rest);
+        if let Ok(int) = from_str_radix(&negative, 8) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = unpositive.strip_prefix("0b") {
+        if rest.starts_with(['+', '-']) {
+            return None;
+        }
+        if let Ok(int) = from_str_radix(rest, 2) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = scalar.strip_prefix("-0b") {
+        let negative = format!("-{}", rest);
+        if let Ok(int) = from_str_radix(&negative, 2) {
+            return Some(int);
+        }
+    }
+    if digits_but_not_number(scalar) {
+        return None;
+    }
+    from_str_radix(unpositive, 10).ok()
+}
+
+fn parse_negative_int<T>(
+    scalar: &str,
+    from_str_radix: fn(&str, radix: u32) -> Result<T, ParseIntError>,
+) -> Option<T> {
+    if let Some(rest) = scalar.strip_prefix("-0x") {
+        let negative = format!("-{}", rest);
+        if let Ok(int) = from_str_radix(&negative, 16) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = scalar.strip_prefix("-0o") {
+        let negative = format!("-{}", rest);
+        if let Ok(int) = from_str_radix(&negative, 8) {
+            return Some(int);
+        }
+    }
+    if let Some(rest) = scalar.strip_prefix("-0b") {
+        let negative = format!("-{}", rest);
+        if let Ok(int) = from_str_radix(&negative, 2) {
+            return Some(int);
+        }
+    }
+    if digits_but_not_number(scalar) {
+        return None;
+    }
+    from_str_radix(scalar, 10).ok()
+}
+
+fn parse_f64(scalar: &str) -> Option<f64> {
+    let unpositive = if let Some(unpositive) = scalar.strip_prefix('+') {
+        if unpositive.starts_with(['+', '-']) {
+            return None;
+        }
+        unpositive
+    } else {
+        scalar
+    };
+    if let ".inf" | ".Inf" | ".INF" = unpositive {
+        return Some(f64::INFINITY);
+    }
+    if let "-.inf" | "-.Inf" | "-.INF" = scalar {
+        return Some(f64::NEG_INFINITY);
+    }
+    if let ".nan" | ".NaN" | ".NAN" = scalar {
+        return Some(f64::NAN);
+    }
+    if let Ok(float) = unpositive.parse::<f64>() {
+        if float.is_finite() {
+            return Some(float);
+        }
+    }
+    None
+}
+
+fn digits_but_not_number(scalar: &str) -> bool {
+    // Leading zero(s) followed by numeric characters is a string according to
+    // the YAML 1.2 spec. https://yaml.org/spec/1.2/spec.html#id2761292
+    let scalar = scalar.strip_prefix(['-', '+']).unwrap_or(scalar);
+    scalar.len() > 1 && scalar.starts_with('0') && scalar[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+fn visit_int<'de, V>(visitor: V, v: &str) -> Result<Result<V::Value>, V>
+where
+    V: Visitor<'de>,
+{
+    if let Some(int) = parse_unsigned_int(v, u64::from_str_radix) {
+        return Ok(visitor.visit_u64(int));
+    }
+    if let Some(int) = parse_negative_int(v, i64::from_str_radix) {
+        return Ok(visitor.visit_i64(int));
+    }
+    if let Some(int) = parse_unsigned_int(v, u128::from_str_radix) {
+        return Ok(visitor.visit_u128(int));
+    }
+    if let Some(int) = parse_negative_int(v, i128::from_str_radix) {
+        return Ok(visitor.visit_i128(int));
+    }
+    Err(visitor)
+}
+
+pub(crate) fn visit_untagged_scalar<'de, V>(
+    visitor: V,
+    v: &str,
+    repr: Option<&'de [u8]>,
+    style: ScalarStyle,
+) -> Result<V::Value>
+where
+    V: Visitor<'de>,
+{
+    if v.is_empty() || parse_null(v.as_bytes()) == Some(()) {
         return visitor.visit_unit();
     }
-    if v == "~" || v == "null" {
-        return visitor.visit_unit();
+    if let Some(boolean) = parse_bool(v) {
+        return visitor.visit_bool(boolean);
     }
-    if v == "true" {
-        return visitor.visit_bool(true);
-    }
-    if v == "false" {
-        return visitor.visit_bool(false);
-    }
-    if let Some(rest) = Option::or(v.strip_prefix("0x"), v.strip_prefix("+0x")) {
-        if let Ok(n) = u64::from_str_radix(rest, 16) {
-            return visitor.visit_u64(n);
+    let visitor = match visit_int(visitor, v) {
+        Ok(result) => return result,
+        Err(visitor) => visitor,
+    };
+    if !digits_but_not_number(v) {
+        if let Some(float) = parse_f64(v) {
+            return visitor.visit_f64(float);
         }
     }
-    if let Some(rest) = v.strip_prefix("-0x") {
-        let negative = format!("-{}", rest);
-        if let Ok(n) = i64::from_str_radix(&negative, 16) {
-            return visitor.visit_i64(n);
-        }
+    if let Some(borrowed) = parse_borrowed_str(v, repr, style) {
+        visitor.visit_borrowed_str(borrowed)
+    } else {
+        visitor.visit_str(v)
     }
-    if let Some(rest) = Option::or(v.strip_prefix("0o"), v.strip_prefix("+0o")) {
-        if let Ok(n) = u64::from_str_radix(rest, 8) {
-            return visitor.visit_u64(n);
-        }
-    }
-    if let Some(rest) = v.strip_prefix("-0o") {
-        let negative = format!("-{}", rest);
-        if let Ok(n) = i64::from_str_radix(&negative, 8) {
-            return visitor.visit_i64(n);
-        }
-    }
-    if let Some(rest) = Option::or(v.strip_prefix("0b"), v.strip_prefix("+0b")) {
-        if let Ok(n) = u64::from_str_radix(rest, 2) {
-            return visitor.visit_u64(n);
-        }
-    }
-    if let Some(rest) = v.strip_prefix("-0b") {
-        let negative = format!("-{}", rest);
-        if let Ok(n) = i64::from_str_radix(&negative, 2) {
-            return visitor.visit_i64(n);
-        }
-    }
-    if {
-        let v = v.trim_start_matches(&['-', '+'][..]);
-        v.len() > 1 && v.starts_with('0') && v[1..].bytes().all(|b| b.is_ascii_digit())
-    } {
-        // After handling the different number encodings above if we are left
-        // with leading zero(s) followed by numeric characters this is in fact a
-        // string according to the YAML 1.2 spec.
-        // https://yaml.org/spec/1.2/spec.html#id2761292
-        return visitor.visit_str(v);
-    }
-    if let Ok(n) = v.parse() {
-        return visitor.visit_u64(n);
-    }
-    if let Ok(n) = v.parse() {
-        return visitor.visit_u128(n);
-    }
-    if let Ok(n) = v.parse() {
-        return visitor.visit_i64(n);
-    }
-    if let Ok(n) = v.parse() {
-        return visitor.visit_i128(n);
-    }
-    match v.trim_start_matches('+') {
-        ".inf" | ".Inf" | ".INF" => return visitor.visit_f64(f64::INFINITY),
-        _ => (),
-    }
-    if v == "-.inf" || v == "-.Inf" || v == "-.INF" {
-        return visitor.visit_f64(f64::NEG_INFINITY);
-    }
-    if v == ".nan" || v == ".NaN" || v == ".NAN" {
-        return visitor.visit_f64(f64::NAN);
-    }
-    if let Ok(n) = v.parse::<f64>() {
-        if n.is_finite() {
-            return visitor.visit_f64(n);
-        }
-    }
-    visitor.visit_str(v)
 }
 
 fn invalid_type(event: &Event, exp: &dyn Expected) -> Error {
@@ -1164,9 +1335,9 @@ fn invalid_type(event: &Event, exp: &dyn Expected) -> Error {
 
     match event {
         Event::Alias(_) => unreachable!(),
-        Event::Scalar(v, style, tag) => {
+        Event::Scalar(scalar) => {
             let get_type = InvalidType { exp };
-            match visit_scalar(v, *style, tag, get_type) {
+            match visit_scalar(get_type, scalar) {
                 Ok(void) => match void {},
                 Err(invalid_type) => invalid_type,
             }
@@ -1178,22 +1349,22 @@ fn invalid_type(event: &Event, exp: &dyn Expected) -> Error {
     }
 }
 
-impl<'a> DeserializerFromEvents<'a> {
-    fn deserialize_scalar<'de, V>(&mut self, visitor: V) -> Result<V::Value>
+impl<'de, 'document> DeserializerFromEvents<'de, 'document> {
+    fn deserialize_scalar<V>(&mut self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
         let (next, mark) = self.next_event_mark()?;
         match next {
             Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_scalar(visitor),
-            Event::Scalar(v, style, tag) => visit_scalar(v, *style, tag, visitor),
+            Event::Scalar(scalar) => visit_scalar(visitor, scalar),
             other => Err(invalid_type(other, &visitor)),
         }
         .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 }
 
-impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
+impl<'de, 'document> de::Deserializer<'de> for &mut DeserializerFromEvents<'de, 'document> {
     type Error = Error;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
@@ -1203,7 +1374,7 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
         let (next, mark) = self.next_event_mark()?;
         match next {
             Event::Alias(mut pos) => self.jump(&mut pos)?.deserialize_any(visitor),
-            Event::Scalar(v, style, tag) => visit_scalar(v, *style, tag, visitor),
+            Event::Scalar(scalar) => visit_scalar(visitor, scalar),
             Event::SequenceStart => self.visit_sequence(visitor, mark),
             Event::MappingStart => self.visit_mapping(visitor, mark),
             Event::SequenceEnd => panic!("unexpected end of sequence"),
@@ -1218,91 +1389,181 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        let (next, mark) = self.next_event_mark()?;
+        loop {
+            match next {
+                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_bool(visitor),
+                Event::Scalar(scalar) if scalar.style == ScalarStyle::Plain => {
+                    if let Ok(value) = str::from_utf8(&scalar.value) {
+                        if let Some(boolean) = parse_bool(value) {
+                            break visitor.visit_bool(boolean);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            break Err(invalid_type(next, &visitor));
+        }
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_i8<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        self.deserialize_i64(visitor)
     }
 
     fn deserialize_i16<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        self.deserialize_i64(visitor)
     }
 
     fn deserialize_i32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        self.deserialize_i64(visitor)
     }
 
     fn deserialize_i64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        let (next, mark) = self.next_event_mark()?;
+        loop {
+            match next {
+                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_i64(visitor),
+                Event::Scalar(scalar) if scalar.style == ScalarStyle::Plain => {
+                    if let Ok(value) = str::from_utf8(&scalar.value) {
+                        if let Some(int) = parse_signed_int(value, i64::from_str_radix) {
+                            break visitor.visit_i64(int);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            break Err(invalid_type(next, &visitor));
+        }
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_i128<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        let (next, mark) = self.next_event_mark()?;
+        loop {
+            match next {
+                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_i128(visitor),
+                Event::Scalar(scalar) if scalar.style == ScalarStyle::Plain => {
+                    if let Ok(value) = str::from_utf8(&scalar.value) {
+                        if let Some(int) = parse_signed_int(value, i128::from_str_radix) {
+                            break visitor.visit_i128(int);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            break Err(invalid_type(next, &visitor));
+        }
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_u8<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        self.deserialize_u64(visitor)
     }
 
     fn deserialize_u16<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        self.deserialize_u64(visitor)
     }
 
     fn deserialize_u32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        self.deserialize_u64(visitor)
     }
 
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        let (next, mark) = self.next_event_mark()?;
+        loop {
+            match next {
+                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_u64(visitor),
+                Event::Scalar(scalar) if scalar.style == ScalarStyle::Plain => {
+                    if let Ok(value) = str::from_utf8(&scalar.value) {
+                        if let Some(int) = parse_unsigned_int(value, u64::from_str_radix) {
+                            break visitor.visit_u64(int);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            break Err(invalid_type(next, &visitor));
+        }
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_u128<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        let (next, mark) = self.next_event_mark()?;
+        loop {
+            match next {
+                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_u128(visitor),
+                Event::Scalar(scalar) if scalar.style == ScalarStyle::Plain => {
+                    if let Ok(value) = str::from_utf8(&scalar.value) {
+                        if let Some(int) = parse_unsigned_int(value, u128::from_str_radix) {
+                            break visitor.visit_u128(int);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            break Err(invalid_type(next, &visitor));
+        }
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_f32<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        self.deserialize_f64(visitor)
     }
 
     fn deserialize_f64<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        self.deserialize_scalar(visitor)
+        let (next, mark) = self.next_event_mark()?;
+        loop {
+            match next {
+                Event::Alias(mut pos) => break self.jump(&mut pos)?.deserialize_f64(visitor),
+                Event::Scalar(scalar) if scalar.style == ScalarStyle::Plain => {
+                    if let Ok(value) = str::from_utf8(&scalar.value) {
+                        if let Some(float) = parse_f64(value) {
+                            break visitor.visit_f64(float);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            break Err(invalid_type(next, &visitor));
+        }
+        .map_err(|err| error::fix_mark(err, mark, self.path))
     }
 
     fn deserialize_char<V>(self, visitor: V) -> Result<V::Value>
@@ -1318,9 +1579,13 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
     {
         let (next, mark) = self.next_event_mark()?;
         match next {
-            Event::Scalar(v, _, _) => {
-                if let Ok(v) = str::from_utf8(v) {
-                    visitor.visit_str(v)
+            Event::Scalar(scalar) => {
+                if let Ok(v) = str::from_utf8(&scalar.value) {
+                    if let Some(borrowed) = parse_borrowed_str(v, scalar.repr, scalar.style) {
+                        visitor.visit_borrowed_str(borrowed)
+                    } else {
+                        visitor.visit_str(v)
+                    }
                 } else {
                     Err(invalid_type(next, &visitor))
                 }
@@ -1362,23 +1627,26 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
                 *self.pos += 1;
                 return self.jump(&mut pos)?.deserialize_option(visitor);
             }
-            Event::Scalar(v, style, tag) => {
-                if *style != ScalarStyle::Plain {
+            Event::Scalar(scalar) => {
+                if scalar.style != ScalarStyle::Plain {
                     true
-                } else if let Some(tag) = tag {
+                } else if let Some(tag) = &scalar.tag {
                     if tag == Tag::NULL {
-                        if **v == *b"~" || **v == *b"null" {
+                        if let Some(()) = parse_null(&scalar.value) {
                             false
-                        } else if let Ok(v) = str::from_utf8(v) {
+                        } else if let Ok(v) = str::from_utf8(&scalar.value) {
                             return Err(de::Error::invalid_value(Unexpected::Str(v), &"null"));
                         } else {
-                            return Err(de::Error::invalid_value(Unexpected::Bytes(v), &"null"));
+                            return Err(de::Error::invalid_value(
+                                Unexpected::Bytes(&scalar.value),
+                                &"null",
+                            ));
                         }
                     } else {
                         true
                     }
                 } else {
-                    **v != *b"" && **v != *b"~" && **v != *b"null"
+                    !scalar.value.is_empty() && parse_null(&scalar.value).is_none()
                 }
             }
             Event::SequenceStart | Event::MappingStart => true,
@@ -1506,8 +1774,8 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
                 self.jump(&mut pos)?
                     .deserialize_enum(name, variants, visitor)
             }
-            Event::Scalar(_, _, tag) => {
-                if let Some((b'!', tag)) = tag.as_ref().and_then(|tag| tag.split_first()) {
+            Event::Scalar(scalar) => {
+                if let Some((b'!', tag)) = scalar.tag.as_ref().and_then(|tag| tag.split_first()) {
                     if let Some(tag) = variants.iter().find(|v| v.as_bytes() == tag) {
                         return visitor.visit_enum(EnumAccess {
                             de: self,
@@ -1564,9 +1832,9 @@ impl<'de, 'a, 'r> de::Deserializer<'de> for &'r mut DeserializerFromEvents<'a> {
 /// type.
 ///
 /// YAML currently does not support zero-copy deserialization.
-pub fn from_str<T>(s: &str) -> Result<T>
+pub fn from_str<'de, T>(s: &'de str) -> Result<T>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'de>,
 {
     from_str_seed(s, PhantomData)
 }
@@ -1582,9 +1850,9 @@ where
 /// type.
 ///
 /// YAML currently does not support zero-copy deserialization.
-pub fn from_str_seed<T, S>(s: &str, seed: S) -> Result<T>
+pub fn from_str_seed<'de, T, S>(s: &'de str, seed: S) -> Result<T>
 where
-    S: for<'de> DeserializeSeed<'de, Value = T>,
+    S: DeserializeSeed<'de, Value = T>,
 {
     seed.deserialize(Deserializer::from_str(s))
 }
@@ -1634,9 +1902,9 @@ where
 /// type.
 ///
 /// YAML currently does not support zero-copy deserialization.
-pub fn from_slice<T>(v: &[u8]) -> Result<T>
+pub fn from_slice<'de, T>(v: &'de [u8]) -> Result<T>
 where
-    T: DeserializeOwned,
+    T: Deserialize<'de>,
 {
     from_slice_seed(v, PhantomData)
 }
@@ -1652,9 +1920,9 @@ where
 /// type.
 ///
 /// YAML currently does not support zero-copy deserialization.
-pub fn from_slice_seed<T, S>(v: &[u8], seed: S) -> Result<T>
+pub fn from_slice_seed<'de, T, S>(v: &'de [u8], seed: S) -> Result<T>
 where
-    S: for<'de> DeserializeSeed<'de, Value = T>,
+    S: DeserializeSeed<'de, Value = T>,
 {
     seed.deserialize(Deserializer::from_slice(v))
 }

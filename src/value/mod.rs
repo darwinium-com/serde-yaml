@@ -9,15 +9,13 @@ mod ser;
 use crate::{Error, Mapping};
 use serde::de::{Deserialize, DeserializeOwned, IntoDeserializer};
 use serde::Serialize;
-use std::f64;
-use std::hash::{Hash, Hasher};
 
 pub use self::index::Index;
 pub use self::ser::Serializer;
 pub use crate::number::Number;
 
 /// Represents any valid YAML value.
-#[derive(Clone, PartialOrd, Debug)]
+#[derive(Clone, PartialEq, PartialOrd, Hash, Debug)]
 pub enum Value {
     /// Represents a YAML null value.
     Null,
@@ -126,19 +124,20 @@ impl Value {
     /// or the given index is not within the bounds of the sequence.
     ///
     /// ```
-    /// # use serde_yaml::Value;
-    /// #
-    /// # fn yaml(i: &str) -> serde_yaml::Value { serde_yaml::from_str(i).unwrap() }
-    /// #
-    /// let object: Value = yaml(r#"{ A: 65, B: 66, C: 67 }"#);
+    /// # fn main() -> serde_yaml::Result<()> {
+    /// use serde_yaml::Value;
+    ///
+    /// let object: Value = serde_yaml::from_str(r#"{ A: 65, B: 66, C: 67 }"#)?;
     /// let x = object.get("A").unwrap();
     /// assert_eq!(x, 65);
     ///
-    /// let sequence: Value = yaml(r#"[ "A", "B", "C" ]"#);
+    /// let sequence: Value = serde_yaml::from_str(r#"[ "A", "B", "C" ]"#)?;
     /// let x = sequence.get(2).unwrap();
     /// assert_eq!(x, &Value::String("C".into()));
     ///
     /// assert_eq!(sequence.get("A"), None);
+    /// # Ok(())
+    /// # }
     /// ```
     ///
     /// Square brackets can also be used to index into a value in a more concise
@@ -148,14 +147,13 @@ impl Value {
     /// ```
     /// # use serde_yaml::Value;
     /// #
-    /// # fn yaml(i: &str) -> serde_yaml::Value { serde_yaml::from_str(i).unwrap() }
-    /// #
-    /// let object = yaml(r#"
+    /// # fn main() -> serde_yaml::Result<()> {
+    /// let object: Value = serde_yaml::from_str(r#"
     /// A: [a, á, à]
     /// B: [b, b́]
     /// C: [c, ć, ć̣, ḉ]
     /// 42: true
-    /// "#);
+    /// "#)?;
     /// assert_eq!(object["B"][0], Value::String("b".into()));
     ///
     /// assert_eq!(object[Value::String("D".into())], Value::Null);
@@ -163,6 +161,8 @@ impl Value {
     /// assert_eq!(object[0]["x"]["y"]["z"], Value::Null);
     ///
     /// assert_eq!(object[42], Value::Bool(true));
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn get<I: Index>(&self, index: I) -> Option<&Value> {
         index.index_into(self)
@@ -590,19 +590,6 @@ impl Value {
 }
 
 impl Eq for Value {}
-
-impl Hash for Value {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Value::Null => 0.hash(state),
-            Value::Bool(b) => (1, b).hash(state),
-            Value::Number(i) => (2, i).hash(state),
-            Value::String(s) => (3, s).hash(state),
-            Value::Sequence(seq) => (4, seq).hash(state),
-            Value::Mapping(map) => (5, map).hash(state),
-        }
-    }
-}
 
 impl<'de> IntoDeserializer<'de, Error> for Value {
     type Deserializer = Self;
